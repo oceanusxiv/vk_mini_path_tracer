@@ -1,6 +1,11 @@
 // Copyright 2020-2021 NVIDIA Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+
+#include <format>
+#include <iostream>
 #include <vulkan/vulkan.hpp>
 // Above must come first!
 #include <nvvk/context_vk.hpp>
@@ -78,6 +83,44 @@ int main(int argc, const char** argv) {
   const float fillValue = 0.5f;
   const uint32_t& fillValueU32 = reinterpret_cast<const uint32_t&>(fillValue);
   vkCmdFillBuffer(cmdBuffer, buffer.buffer, 0, bufferSizeBytes, fillValueU32);
+
+  // Add a command that says "Make it so that memory writes by the
+  // vkCmdFillBuffer call are available to read from the CPU." (In other words,
+  // "Flush the GPU caches so the CPU can read the data.") To do this, we use a
+  // memory barrier.
+  VkMemoryBarrier memoryBarrier = nvvk::make<VkMemoryBarrier>();
+  memoryBarrier.srcAccessMask =
+      VK_ACCESS_TRANSFER_WRITE_BIT;  // Make transfer writes
+  memoryBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;  // Readable by the CPU
+  vkCmdPipelineBarrier(
+      cmdBuffer,                       // The command buffer
+      VK_PIPELINE_STAGE_TRANSFER_BIT,  // From the transfer stage
+      VK_PIPELINE_STAGE_HOST_BIT,      // To the CPU
+      0,                               // No special flags
+      1, &memoryBarrier,               // An array of memory barriers
+      0, nullptr, 0, nullptr);         // No other barriers
+
+  // End recording
+  NVVK_CHECK(vkEndCommandBuffer(cmdBuffer));
+
+  // Submit the command buffer
+  VkSubmitInfo submitInfo = nvvk::make<VkSubmitInfo>();
+  submitInfo.commandBufferCount = 1;
+  submitInfo.pCommandBuffers = &cmdBuffer;
+  NVVK_CHECK(vkQueueSubmit(context.m_queueGCT, 1, &submitInfo, VK_NULL_HANDLE));
+
+  // Wait for the GPU to finish
+  NVVK_CHECK(vkQueueWaitIdle(context.m_queueGCT));
+
+  vkFreeCommandBuffers(context, cmdPool, 1, &cmdBuffer);
+  vkDestroyCommandPool(context, cmdPool, nullptr);
+
+  // Get the image data back from the GPU
+  void* data = allocator.map(buffer);
+  stbi_write_hdr("out.hdr", render_width, render_height, 3,
+                 reinterpret_cast<float*>(data));
+
+  allocator.unmap(buffer);
 
   allocator.destroy(buffer);
   allocator.deinit();
